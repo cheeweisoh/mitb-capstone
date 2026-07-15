@@ -1,5 +1,4 @@
 import json
-import re
 import time
 from typing import Any
 
@@ -56,66 +55,8 @@ Judge the draft answer on three points:
 3. Responsiveness: does it actually answer the patient's question rather than being a non-answer?
 
 Respond with a single JSON object and nothing else, in this exact shape:
-{{"passed": true or false, "reasoning": "<one sentence explaining the verdict>", "reformulated_query": "<a better search query to re-retrieve guideline excerpts if the failure looks like a retrieval problem, or null>"}}
-
-Only set "reformulated_query" to a non-null string when "passed" is false AND the root cause looks like
-the excerpts not covering the right condition/topic (a retrieval miss), not when the failure is purely
-about how the draft was written.
+{{"passed": true or false, "reasoning": "<one sentence explaining the verdict>"}}
 """
-
-TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]{2,}")
-STOPWORDS = {
-    "about",
-    "after",
-    "also",
-    "been",
-    "being",
-    "could",
-    "does",
-    "from",
-    "have",
-    "into",
-    "just",
-    "like",
-    "more",
-    "need",
-    "only",
-    "read",
-    "really",
-    "should",
-    "some",
-    "that",
-    "their",
-    "there",
-    "these",
-    "they",
-    "this",
-    "what",
-    "when",
-    "where",
-    "with",
-    "would",
-}
-
-
-def content_terms(text: str) -> set[str]:
-    return {token.casefold() for token in TOKEN_RE.findall(text) if token.casefold() not in STOPWORDS}
-
-
-def rerank_for_adherence(query: str, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    query_terms = content_terms(query)
-
-    def overlap(result: dict[str, Any]) -> int:
-        text = f"{result['heading']} {result['text']}"
-        return len(query_terms & content_terms(text))
-
-    return [
-        result
-        for _, result in sorted(
-            enumerate(results),
-            key=lambda item: (-overlap(item[1]), item[0]),
-        )
-    ]
 
 
 def format_context(results: list[dict[str, Any]], max_chars: int) -> str:
@@ -165,11 +106,6 @@ def citations_json(retrieved_chunks: list[dict[str, Any]]) -> str:
                 "end_page": result["end_page"],
                 "heading": result["heading"],
                 "score": result["score"],
-                "fusion_score": result.get("fusion_score"),
-                "dense_rank": result.get("dense_rank"),
-                "dense_score": result.get("dense_score"),
-                "bm25_rank": result.get("bm25_rank"),
-                "bm25_score": result.get("bm25_score"),
             }
         )
     return json.dumps(citations, ensure_ascii=False)
@@ -190,8 +126,6 @@ def make_output_record(
     max_context_chars: int,
     verification_passed: bool | None = None,
     verification_reasoning: str = "",
-    retrieval_iterations: int = 1,
-    retrieval_queries_used: list[str] | None = None,
 ) -> dict[str, Any]:
     record = row.to_dict()
     record["generated_answer"] = generated_answer
@@ -204,8 +138,6 @@ def make_output_record(
     record["top_k_scores"] = scores_json(retrieved_chunks)
     record["verification_passed"] = verification_passed
     record["verification_reasoning"] = verification_reasoning
-    record["retrieval_iterations"] = retrieval_iterations
-    record["retrieval_queries_used"] = json.dumps(retrieval_queries_used or [], ensure_ascii=False)
     return record
 
 
