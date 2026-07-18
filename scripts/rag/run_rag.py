@@ -9,11 +9,9 @@ from dotenv import load_dotenv
 from huggingface_hub import login
 from tqdm import tqdm
 
-from agentic_rag_workflow import AgenticRagWorkflow
+from agentic_rag_workflow import DEFAULT_MAX_ITERATIONS, AgenticRagWorkflow
 from generator_adapters import ADAPTER_BUILDERS
-from llamaindex_retriever import (DEFAULT_INDEX_DIR, DEFAULT_MIN_SCORE,
-                                  DEFAULT_RERANK_CANDIDATES,
-                                  DEFAULT_RERANK_MODEL, LlamaIndexRagRetriever)
+from llamaindex_retriever import DEFAULT_INDEX_DIR, LlamaIndexRagRetriever
 from rag_prompts import load_qa_rows, make_output_record, sleep_before_retry
 
 DEFAULT_INPUT_PATH = Path("dataset/guidelines/guidelines_qa_pairs.csv")
@@ -48,13 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=None, help="Output CSV path. Default: dataset/rag/rag_<model>_guidelines_qa.csv")
     parser.add_argument("--index", type=Path, default=DEFAULT_INDEX_DIR, help=f"LlamaIndex FAISS storage directory. Default: {DEFAULT_INDEX_DIR}")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help=f"Number of chunks to retrieve per question. Default: {DEFAULT_TOP_K}")
-    parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE, help=f"Drop retrieved chunks below this cosine similarity. Default: {DEFAULT_MIN_SCORE}")
-    parser.add_argument("--no-rerank", action="store_true", help="Skip cross-encoder reranking and use raw dense-retrieval order.")
-    parser.add_argument("--rerank-model", type=str, default=DEFAULT_RERANK_MODEL, help=f"Cross-encoder model used to rerank candidates. Default: {DEFAULT_RERANK_MODEL}")
-    parser.add_argument("--rerank-candidates", type=int, default=DEFAULT_RERANK_CANDIDATES, help=f"Candidate pool size fed to the reranker before truncating to top-k. Default: {DEFAULT_RERANK_CANDIDATES}")
     parser.add_argument("--rows", type=int, default=None, help="Limit generation to the first N rows.")
     parser.add_argument("--max-context-chars", type=int, default=DEFAULT_MAX_CONTEXT_CHARS, help=f"Maximum context characters sent to the LLM. Default: {DEFAULT_MAX_CONTEXT_CHARS}")
     parser.add_argument("--no-verify", action="store_true", help="Skip the verify step entirely (retrieve+draft only, no verifier call).")
+    parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS, help=f"Max draft->verify passes per question before falling back to the last draft. Default: {DEFAULT_MAX_ITERATIONS}")
     parser.add_argument("--retries", type=int, default=3, help="Retries if a row's final answer comes back empty. Default: 3")
     return parser.parse_args()
 
@@ -68,10 +63,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-context-chars must be at least 1000")
     if args.retries < 1:
         raise SystemExit("--retries must be at least 1")
-    if not -1.0 <= args.min_score <= 1.0:
-        raise SystemExit("--min-score must be between -1.0 and 1.0")
-    if args.rerank_candidates < 1:
-        raise SystemExit("--rerank-candidates must be at least 1")
+    if args.max_iterations < 1:
+        raise SystemExit("--max-iterations must be at least 1")
 
 
 async def generate_for_row(workflow: AgenticRagWorkflow, question: str, retries: int):
@@ -99,13 +92,7 @@ async def main_async() -> None:
 
     qa_df = load_qa_rows(args.input, rows=args.rows)
 
-    retriever = LlamaIndexRagRetriever(
-        index_dir=args.index,
-        min_score=args.min_score,
-        rerank=not args.no_rerank,
-        rerank_model_name=args.rerank_model,
-        rerank_candidates=args.rerank_candidates,
-    )
+    retriever = LlamaIndexRagRetriever(index_dir=args.index)
     generator = ADAPTER_BUILDERS[args.model]()
     verifier_llm = NoVerifyLLM() if args.no_verify else generator
     workflow = AgenticRagWorkflow(
@@ -114,6 +101,7 @@ async def main_async() -> None:
         verifier_llm=verifier_llm,
         top_k=args.top_k,
         max_context_chars=args.max_context_chars,
+        max_iterations=args.max_iterations,
         timeout=None,
     )
 
@@ -132,6 +120,7 @@ async def main_async() -> None:
             args.max_context_chars,
             verification_passed=result.verification_passed,
             verification_reasoning=result.verification_reasoning,
+            verification_iterations=result.verification_iterations,
         )
         pd.DataFrame([record]).to_csv(output_path, mode="w" if write_header else "a", header=write_header, index=False)
         write_header = False

@@ -29,6 +29,34 @@ Guideline excerpts:
 {context}
 """
 
+REDRAFT_USER_PROMPT = """\
+Answer the following question from a patient.
+Provide a concise and specific answer in two to three sentences.
+First decide whether the excerpts directly answer the question.
+Use an excerpt only if its patient group, condition, and intervention match the question.
+Do not apply a recommendation from one indication to another.
+Do not add dates, targets, follow-up intervals, organizations, or thresholds unless they are explicitly stated in the excerpts.
+If the excerpts are partially relevant, synthesize the relevant practical advice instead of saying the answer is not covered.
+If the excerpts are unrelated, say they do not directly cover the question and give safe general advice.
+Do not explain your reasoning, mention the retrieval process, or summarize the excerpts.
+Include citation labels only for recommendations you actually use, such as [C1] or [C2].
+
+Question:
+{question}
+
+Guideline excerpts:
+{context}
+
+Your previous answer was rejected by a clinical safety reviewer:
+Previous answer:
+{prior_draft}
+
+Reviewer's reasoning:
+{feedback}
+
+Write a corrected answer that fixes the issue the reviewer raised, using only the excerpts above.
+"""
+
 VERIFY_SYSTEM_PROMPT = (
     "You are a clinical safety reviewer checking a draft answer against the guideline excerpts "
     "it was supposedly based on. You are strict about groundedness and patient safety, but you "
@@ -86,6 +114,21 @@ def build_user_prompt(question: str, retrieved_chunks: list[dict[str, Any]], max
     )
 
 
+def build_redraft_user_prompt(
+    question: str,
+    retrieved_chunks: list[dict[str, Any]],
+    max_context_chars: int,
+    prior_draft: str,
+    feedback: str,
+) -> str:
+    return REDRAFT_USER_PROMPT.format(
+        question=question,
+        context=format_context(retrieved_chunks, max_chars=max_context_chars),
+        prior_draft=prior_draft,
+        feedback=feedback,
+    )
+
+
 def build_verify_user_prompt(question: str, retrieved_chunks: list[dict[str, Any]], draft_answer: str, max_context_chars: int) -> str:
     return VERIFY_USER_PROMPT.format(
         question=question,
@@ -126,6 +169,7 @@ def make_output_record(
     max_context_chars: int,
     verification_passed: bool | None = None,
     verification_reasoning: str = "",
+    verification_iterations: int = 1,
 ) -> dict[str, Any]:
     record = row.to_dict()
     record["generated_answer"] = generated_answer
@@ -138,6 +182,7 @@ def make_output_record(
     record["top_k_scores"] = scores_json(retrieved_chunks)
     record["verification_passed"] = verification_passed
     record["verification_reasoning"] = verification_reasoning
+    record["verification_iterations"] = verification_iterations
     return record
 
 

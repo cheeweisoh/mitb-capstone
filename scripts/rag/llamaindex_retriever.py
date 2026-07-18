@@ -7,18 +7,10 @@ from llama_index.core import StorageContext, VectorStoreIndex, load_index_from_s
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.faiss import FaissVectorStore
-from sentence_transformers import CrossEncoder
 
 DEFAULT_CHUNKS_PATH = Path("dataset/rag/rag_chunks.csv")
 DEFAULT_INDEX_DIR = Path("dataset/rag/llamaindex_faiss")
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-# Cosine-similarity floor below which a retrieved chunk is dropped rather than
-# forced into context just to fill top_k. Set from the observed score
-# distribution on guideline retrieval (~5th percentile of true-match scores).
-DEFAULT_MIN_SCORE = 0.35
-DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-# Candidate pool size fed to the cross-encoder before truncating to top_k.
-DEFAULT_RERANK_CANDIDATES = 20
 
 
 def load_chunk_rows(chunks_path: Path = DEFAULT_CHUNKS_PATH) -> list[dict[str, str]]:
@@ -109,18 +101,6 @@ def dense_search(index: VectorStoreIndex, query: str, top_k: int) -> list[dict[s
     return [node_to_result_dict(nws) for nws in retriever.retrieve(query)]
 
 
-def rerank_results(query: str, results: list[dict[str, Any]], cross_encoder: CrossEncoder) -> list[dict[str, Any]]:
-    """Re-score dense candidates with a cross-encoder and re-sort by that score.
-    Adds a 'rerank_score' field; the original dense 'score' is left untouched."""
-    if not results:
-        return results
-    pairs = [(query, str(result["text"])) for result in results]
-    rerank_scores = cross_encoder.predict(pairs)
-    for result, rerank_score in zip(results, rerank_scores):
-        result["rerank_score"] = float(rerank_score)
-    return sorted(results, key=lambda result: result["rerank_score"], reverse=True)
-
-
 class LlamaIndexRagRetriever:
     """Drop-in replacement for the legacy RagRetriever (rag_generation.py).
     Same constructor/retrieve() shape so callers change only their import."""
@@ -131,10 +111,6 @@ class LlamaIndexRagRetriever:
         chunks_path: Path = DEFAULT_CHUNKS_PATH,
         embed_model_name: str = DEFAULT_EMBED_MODEL,
         device: str | None = None,
-        min_score: float = DEFAULT_MIN_SCORE,
-        rerank: bool = True,
-        rerank_model_name: str = DEFAULT_RERANK_MODEL,
-        rerank_candidates: int = DEFAULT_RERANK_CANDIDATES,
     ) -> None:
         self.index = build_or_load_index(
             chunks_path=chunks_path,
@@ -142,14 +118,6 @@ class LlamaIndexRagRetriever:
             embed_model_name=embed_model_name,
             device=device,
         )
-        self.min_score = min_score
-        self.rerank_candidates = rerank_candidates
-        self.cross_encoder = CrossEncoder(rerank_model_name, device=device) if rerank else None
 
     def retrieve(self, query: str, top_k: int) -> list[dict[str, Any]]:
-        candidate_k = max(top_k, self.rerank_candidates) if self.cross_encoder is not None else top_k
-        results = dense_search(self.index, query, candidate_k)
-        results = [result for result in results if result["score"] >= self.min_score]
-        if self.cross_encoder is not None:
-            results = rerank_results(query, results, self.cross_encoder)
-        return results[:top_k]
+        return dense_search(self.index, query, top_k)
