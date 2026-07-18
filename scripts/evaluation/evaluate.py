@@ -213,6 +213,7 @@ def _evaluate_row(client: OpenAI, row: dict, retriever: GuidelineRetriever, top_
                     {"role": "user", "content": user_msg},
                 ],
                 response_format={"type": "json_object"},
+                temperature=0,
             )
             result = json.loads(response.choices[0].message.content)
             required = {
