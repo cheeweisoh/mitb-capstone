@@ -11,6 +11,9 @@ from llama_index.vector_stores.faiss import FaissVectorStore
 DEFAULT_CHUNKS_PATH = Path("dataset/rag/rag_chunks.csv")
 DEFAULT_INDEX_DIR = Path("dataset/rag/llamaindex_faiss")
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# Cosine-similarity floor below which a retrieved chunk is dropped rather than
+# forced into context just to fill top_k.
+DEFAULT_MIN_SCORE = 0.35
 
 
 def load_chunk_rows(chunks_path: Path = DEFAULT_CHUNKS_PATH) -> list[dict[str, str]]:
@@ -111,6 +114,7 @@ class LlamaIndexRagRetriever:
         chunks_path: Path = DEFAULT_CHUNKS_PATH,
         embed_model_name: str = DEFAULT_EMBED_MODEL,
         device: str | None = None,
+        min_score: float = DEFAULT_MIN_SCORE,
     ) -> None:
         self.index = build_or_load_index(
             chunks_path=chunks_path,
@@ -118,6 +122,8 @@ class LlamaIndexRagRetriever:
             embed_model_name=embed_model_name,
             device=device,
         )
+        self.min_score = min_score
 
     def retrieve(self, query: str, top_k: int) -> list[dict[str, Any]]:
-        return dense_search(self.index, query, top_k)
+        results = dense_search(self.index, query, top_k)
+        return [result for result in results if result["score"] >= self.min_score]
