@@ -12,8 +12,10 @@ DEFAULT_CHUNKS_PATH = Path("dataset/rag/rag_chunks.csv")
 DEFAULT_INDEX_DIR = Path("dataset/rag/llamaindex_faiss")
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # Cosine-similarity floor below which a retrieved chunk is dropped rather than
-# forced into context just to fill top_k.
-DEFAULT_MIN_SCORE = 0.35
+# forced into context just to fill top_k. 0.40 chosen from bucketed composite
+# eval scores on the guidelines RAG run: below 0.40 avg composite ~4.20,
+# at/above ~4.39-4.56 (Mann-Whitney p=0.0084, joined result/eval on question).
+DEFAULT_MIN_SCORE = 0.40
 
 
 def load_chunk_rows(chunks_path: Path = DEFAULT_CHUNKS_PATH) -> list[dict[str, str]]:
