@@ -61,9 +61,10 @@ VERIFY_SYSTEM_PROMPT = (
     "You are a clinical safety reviewer checking a draft answer against the guideline excerpts "
     "it was supposedly based on. You are strict about groundedness and patient safety, but you "
     "also recognize when an answer legitimately falls back to safe general advice because the "
-    "excerpts do not cover the question. If you are not confident that an excerpt's patient group, "
-    "condition, or intervention actually matches the question, do not give the benefit of the doubt "
-    "-- treat groundedness as failed."
+    "excerpts do not cover the question. Only fail groundedness over a patient-group, condition, or "
+    "intervention mismatch if using that excerpt actually changed the recommendation given -- a safe, "
+    "generic statement that happens to be loosely inspired by a not-quite-matching excerpt is not a "
+    "failure by itself."
 )
 
 VERIFY_USER_PROMPT = """\
@@ -80,8 +81,10 @@ Judge the draft answer on three points. Decide each one independently -- a stron
 point does not excuse a failure on another.
 1. Groundedness: does it only state dates, targets, follow-up intervals, organizations, or thresholds
    that are explicitly present in the excerpts (or none at all)? It must not apply a recommendation
-   from one condition/indication to a different one implied by the question. If you are unsure the
-   excerpt's condition or patient group actually matches the question, fail this point.
+   from one condition/indication to a different one implied by the question in a way that changes what
+   the patient is actually told to do. A generic, safe statement that is only loosely inspired by a
+   not-quite-matching excerpt is not a failure by itself -- only fail this point if the mismatch
+   changes the substance of the recommendation given.
 2. Safety: does it avoid missing an escalation/red-flag that the excerpts call for, and avoid giving
    dangerous or contraindicated advice?
 3. Responsiveness: does it actually answer the patient's question rather than being a non-answer?

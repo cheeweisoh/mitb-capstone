@@ -21,6 +21,14 @@ DEFAULT_MAX_ITERATIONS = 2
 # whole verdict (see rag_prompts.VERIFY_USER_PROMPT for the matching schema).
 _VERIFY_CRITERIA = ("groundedness", "safety", "responsiveness")
 
+# Failing one of these criteria is worth spending a re-retrieval + redraft
+# cycle on; a responsiveness-only failure (non-answer, incomplete answer)
+# still fails the overall verdict and is reported as such, but doesn't burn a
+# retry -- it's not the failure mode re-retrieval can fix, and it wasn't the
+# category behind the false-positive-driven regressions we saw from a stricter
+# verifier.
+_RETRY_TRIGGERING_CRITERIA = frozenset({"groundedness", "safety"})
+
 # Retrieval-confidence floor used to override a verifier "pass" even when the
 # LLM verdict looked fine: a verifier judging a draft as grounded, safe, and
 # responsive still can't vouch for chunks it was only ever shown at
@@ -67,6 +75,8 @@ def _merge_and_rerank_chunks(existing: list[dict[str, Any]], new: list[dict[str,
 class VerifierVerdict:
     passed: bool | None  # None = verifier itself errored (fail-open, tri-state)
     reasoning: str
+    n_failed: int = 0  # count of failing criteria; used to rank attempts when none pass
+    retry_eligible: bool = False  # whether this failure is worth a re-retrieval + redraft cycle
 
 
 @dataclass
@@ -84,6 +94,14 @@ class DraftEvent(Event):
     iteration: int
     prior_draft: str | None = None
     feedback: str | None = None
+    # Best attempt seen so far across iterations (fewest failing criteria),
+    # carried through so a worse final redraft can't overwrite a better
+    # earlier one. best_answer is None only before the first verify() call.
+    best_answer: str | None = None
+    best_chunks: list[dict[str, Any]] | None = None
+    best_reasoning: str = ""
+    best_passed: bool | None = None
+    best_n_failed: int = 0
 
 
 class VerifyEvent(Event):
@@ -91,6 +109,11 @@ class VerifyEvent(Event):
     retrieved_chunks: list[dict[str, Any]]
     draft_answer: str
     iteration: int
+    best_answer: str | None = None
+    best_chunks: list[dict[str, Any]] | None = None
+    best_reasoning: str = ""
+    best_passed: bool | None = None
+    best_n_failed: int = 0
 
 
 class AgenticRagWorkflow(Workflow):
@@ -105,6 +128,20 @@ class AgenticRagWorkflow(Workflow):
     the verifier's feedback names what's missing. A verifier error (fail-open,
     passed=None) is treated the same as a pass, since it doesn't indicate the
     answer is actually wrong.
+
+    If no iteration ever passes, the loop does not blindly return the last
+    (highest-iteration) draft: re-retrieval can itself pull in a wrong-indication
+    chunk that makes a redraft worse than what it replaced, and a verifier that
+    still rejects the final draft doesn't mean earlier attempts were worse. The
+    result is instead the attempt with the fewest failing criteria across all
+    iterations, ties going to the earlier attempt (its retrieval wasn't shaped
+    by a requery chasing the verifier's feedback).
+
+    Not every failing criterion is worth a retry: only groundedness/safety
+    failures trigger re-retrieval (see _RETRY_TRIGGERING_CRITERIA). A
+    responsiveness-only failure still fails the overall verdict and is
+    reported honestly, but doesn't spend a retry cycle on a failure mode
+    re-retrieval can't fix anyway.
     """
 
     def __init__(
@@ -142,7 +179,17 @@ class AgenticRagWorkflow(Workflow):
                 ev.query, ev.retrieved_chunks, self.max_context_chars, ev.prior_draft, ev.feedback or ""
             )
         answer = await self.generator.agenerate(SYSTEM_PROMPT, user_prompt)
-        return VerifyEvent(query=ev.query, retrieved_chunks=ev.retrieved_chunks, draft_answer=answer or "", iteration=ev.iteration)
+        return VerifyEvent(
+            query=ev.query,
+            retrieved_chunks=ev.retrieved_chunks,
+            draft_answer=answer or "",
+            iteration=ev.iteration,
+            best_answer=ev.best_answer,
+            best_chunks=ev.best_chunks,
+            best_reasoning=ev.best_reasoning,
+            best_passed=ev.best_passed,
+            best_n_failed=ev.best_n_failed,
+        )
 
     async def _run_verifier(self, ev: VerifyEvent) -> VerifierVerdict:
         prompt = build_verify_user_prompt(ev.query, ev.retrieved_chunks, ev.draft_answer, self.max_context_chars)
@@ -154,12 +201,14 @@ class AgenticRagWorkflow(Workflow):
             if not required.issubset(payload.keys()):
                 raise ValueError(f"verifier response missing required keys: {payload}")
             criteria_passed = {c: bool(payload[f"{c}_passed"]) for c in _VERIFY_CRITERIA}
-            passed = all(criteria_passed.values())
+            n_failed = sum(1 for p in criteria_passed.values() if not p)
+            passed = n_failed == 0
+            retry_eligible = any(not criteria_passed[c] for c in _RETRY_TRIGGERING_CRITERIA)
             # On failure, surface only the failing criteria's reasoning -- that's
             # what feeds the requery and redraft prompt, so a criterion that
             # already passed shouldn't dilute the actual problem.
             reasons = [str(payload[f"{c}_reasoning"]) for c in _VERIFY_CRITERIA if passed or not criteria_passed[c]]
-            return VerifierVerdict(passed=passed, reasoning=" ".join(reasons))
+            return VerifierVerdict(passed=passed, reasoning=" ".join(reasons), n_failed=n_failed, retry_eligible=retry_eligible)
         except Exception as e:
             return VerifierVerdict(passed=None, reasoning=f"verifier_error: {e}")
 
@@ -173,8 +222,21 @@ class AgenticRagWorkflow(Workflow):
                     f"retrieval override: verifier passed the draft, but the best retrieved chunk "
                     f"scored below {self.verify_score_floor}, so the grounding it was judged against is weak."
                 ),
+                n_failed=1,
+                retry_eligible=True,
             )
-        if verdict.passed is False and ev.iteration < self.max_iterations:
+
+        # Update the running best attempt: fewer failing criteria wins; ties
+        # keep the existing (earlier) best, since this iteration's context may
+        # be a requery chasing feedback rather than a clean original retrieval.
+        if ev.best_answer is None or verdict.n_failed < ev.best_n_failed:
+            best_answer, best_chunks = ev.draft_answer, ev.retrieved_chunks
+            best_reasoning, best_passed, best_n_failed = verdict.reasoning, verdict.passed, verdict.n_failed
+        else:
+            best_answer, best_chunks = ev.best_answer, ev.best_chunks
+            best_reasoning, best_passed, best_n_failed = ev.best_reasoning, ev.best_passed, ev.best_n_failed
+
+        if verdict.passed is False and verdict.retry_eligible and ev.iteration < self.max_iterations:
             requery = _build_requery(ev.query, verdict.reasoning)
             new_chunks = self.retriever.retrieve(requery, top_k=self.top_k)
             retrieved_chunks = _merge_and_rerank_chunks(ev.retrieved_chunks, new_chunks, self.top_k)
@@ -184,13 +246,18 @@ class AgenticRagWorkflow(Workflow):
                 iteration=ev.iteration + 1,
                 prior_draft=ev.draft_answer,
                 feedback=verdict.reasoning,
+                best_answer=best_answer,
+                best_chunks=best_chunks,
+                best_reasoning=best_reasoning,
+                best_passed=best_passed,
+                best_n_failed=best_n_failed,
             )
         return StopEvent(
             result=AgenticRagResult(
-                final_answer=ev.draft_answer,
-                retrieved_chunks=ev.retrieved_chunks,
-                verification_passed=verdict.passed,
-                verification_reasoning=verdict.reasoning,
+                final_answer=best_answer,
+                retrieved_chunks=best_chunks,
+                verification_passed=best_passed,
+                verification_reasoning=best_reasoning,
                 verification_iterations=ev.iteration,
             )
         )
