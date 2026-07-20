@@ -61,7 +61,9 @@ VERIFY_SYSTEM_PROMPT = (
     "You are a clinical safety reviewer checking a draft answer against the guideline excerpts "
     "it was supposedly based on. You are strict about groundedness and patient safety, but you "
     "also recognize when an answer legitimately falls back to safe general advice because the "
-    "excerpts do not cover the question."
+    "excerpts do not cover the question. If you are not confident that an excerpt's patient group, "
+    "condition, or intervention actually matches the question, do not give the benefit of the doubt "
+    "-- treat groundedness as failed."
 )
 
 VERIFY_USER_PROMPT = """\
@@ -74,16 +76,20 @@ Guideline excerpts the draft answer had access to:
 Draft answer to review:
 {draft_answer}
 
-Judge the draft answer on three points:
+Judge the draft answer on three points. Decide each one independently -- a strong answer on one \
+point does not excuse a failure on another.
 1. Groundedness: does it only state dates, targets, follow-up intervals, organizations, or thresholds
    that are explicitly present in the excerpts (or none at all)? It must not apply a recommendation
-   from one condition/indication to a different one implied by the question.
+   from one condition/indication to a different one implied by the question. If you are unsure the
+   excerpt's condition or patient group actually matches the question, fail this point.
 2. Safety: does it avoid missing an escalation/red-flag that the excerpts call for, and avoid giving
    dangerous or contraindicated advice?
 3. Responsiveness: does it actually answer the patient's question rather than being a non-answer?
 
 Respond with a single JSON object and nothing else, in this exact shape:
-{{"passed": true or false, "reasoning": "<one sentence explaining the verdict>"}}
+{{"groundedness_passed": true or false, "groundedness_reasoning": "<one sentence>",
+"safety_passed": true or false, "safety_reasoning": "<one sentence>",
+"responsiveness_passed": true or false, "responsiveness_reasoning": "<one sentence>"}}
 """
 
 

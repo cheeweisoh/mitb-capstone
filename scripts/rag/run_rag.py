@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 from huggingface_hub import login
 from tqdm import tqdm
 
-from agentic_rag_workflow import DEFAULT_MAX_ITERATIONS, AgenticRagWorkflow
+from agentic_rag_workflow import (DEFAULT_MAX_ITERATIONS, DEFAULT_VERIFY_SCORE_FLOOR,
+                                  AgenticRagWorkflow)
 from generator_adapters import ADAPTER_BUILDERS
 from llamaindex_retriever import DEFAULT_INDEX_DIR, DEFAULT_MIN_SCORE, LlamaIndexRagRetriever
 from rag_prompts import load_qa_rows, make_output_record, sleep_before_retry
@@ -36,7 +37,10 @@ class NoVerifyLLM:
     making any API call, so the workflow's verify step is a no-op."""
 
     async def agenerate(self, system_prompt: str, user_prompt: str) -> str:
-        return json.dumps({"passed": True, "reasoning": "verification skipped (--no-verify)"})
+        skipped = {"passed": True, "reasoning": "verification skipped (--no-verify)"}
+        return json.dumps(
+            {f"{c}_{field}": skipped[field] for c in ("groundedness", "safety", "responsiveness") for field in skipped}
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-context-chars", type=int, default=DEFAULT_MAX_CONTEXT_CHARS, help=f"Maximum context characters sent to the LLM. Default: {DEFAULT_MAX_CONTEXT_CHARS}")
     parser.add_argument("--no-verify", action="store_true", help="Skip the verify step entirely (retrieve+draft only, no verifier call).")
     parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS, help=f"Max draft->verify passes per question before falling back to the last draft. Default: {DEFAULT_MAX_ITERATIONS}")
+    parser.add_argument(
+        "--verify-score-floor",
+        type=float,
+        default=DEFAULT_VERIFY_SCORE_FLOOR,
+        help=f"Override a verifier pass to a fail if the best retrieved chunk scores below this. Default: {DEFAULT_VERIFY_SCORE_FLOOR}",
+    )
     parser.add_argument("--retries", type=int, default=3, help="Retries if a row's final answer comes back empty. Default: 3")
     return parser.parse_args()
 
@@ -73,6 +83,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--retries must be at least 1")
     if args.max_iterations < 1:
         raise SystemExit("--max-iterations must be at least 1")
+    if not 0 <= args.verify_score_floor <= 1:
+        raise SystemExit("--verify-score-floor must be between 0 and 1")
 
 
 async def generate_for_row(workflow: AgenticRagWorkflow, question: str, retries: int):
@@ -110,6 +122,7 @@ async def main_async() -> None:
         top_k=args.top_k,
         max_context_chars=args.max_context_chars,
         max_iterations=args.max_iterations,
+        verify_score_floor=None if args.no_verify else args.verify_score_floor,
         timeout=None,
     )
 

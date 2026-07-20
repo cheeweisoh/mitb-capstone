@@ -17,6 +17,30 @@ _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 DEFAULT_MAX_ITERATIONS = 2
 
+# Criteria the verifier must pass independently; failing any one fails the
+# whole verdict (see rag_prompts.VERIFY_USER_PROMPT for the matching schema).
+_VERIFY_CRITERIA = ("groundedness", "safety", "responsiveness")
+
+# Retrieval-confidence floor used to override a verifier "pass" even when the
+# LLM verdict looked fine: a verifier judging a draft as grounded, safe, and
+# responsive still can't vouch for chunks it was only ever shown at
+# borderline relevance. 0.45 sits one bucket above the retrieval min_score
+# (0.40) -- the bucketed eval showed quality still climbing at 0.40-0.45
+# before plateauing higher, so this catches retrieval that cleared the floor
+# but is still weak, without re-triggering on every already-decent match.
+DEFAULT_VERIFY_SCORE_FLOOR = 0.45
+
+
+def _weak_retrieval(chunks: list[dict[str, Any]], score_floor: float | None) -> bool:
+    """True if no chunk was retrieved, or none scored at/above score_floor.
+    A score_floor of None disables the check entirely (always returns False),
+    used when the verifier itself is disabled (--no-verify)."""
+    if score_floor is None:
+        return False
+    if not chunks:
+        return True
+    return max(chunk["score"] for chunk in chunks) < score_floor
+
 
 def _build_requery(question: str, feedback: str) -> str:
     """Fold the verifier's rejection reasoning into the original question so
@@ -91,6 +115,7 @@ class AgenticRagWorkflow(Workflow):
         top_k: int = 5,
         max_context_chars: int = 7000,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        verify_score_floor: float | None = DEFAULT_VERIFY_SCORE_FLOOR,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -100,6 +125,7 @@ class AgenticRagWorkflow(Workflow):
         self.top_k = top_k
         self.max_context_chars = max_context_chars
         self.max_iterations = max_iterations
+        self.verify_score_floor = verify_score_floor
 
     @step
     async def retrieve(self, ctx: Context, ev: StartEvent) -> DraftEvent:
@@ -124,15 +150,30 @@ class AgenticRagWorkflow(Workflow):
             content = await self.verifier_llm.agenerate(VERIFY_SYSTEM_PROMPT, prompt)
             match = _JSON_OBJECT_RE.search(content or "")
             payload = json.loads(match.group(0) if match else content)
-            if not {"passed", "reasoning"}.issubset(payload.keys()):
+            required = {f"{c}_{field}" for c in _VERIFY_CRITERIA for field in ("passed", "reasoning")}
+            if not required.issubset(payload.keys()):
                 raise ValueError(f"verifier response missing required keys: {payload}")
-            return VerifierVerdict(passed=bool(payload["passed"]), reasoning=str(payload["reasoning"]))
+            criteria_passed = {c: bool(payload[f"{c}_passed"]) for c in _VERIFY_CRITERIA}
+            passed = all(criteria_passed.values())
+            # On failure, surface only the failing criteria's reasoning -- that's
+            # what feeds the requery and redraft prompt, so a criterion that
+            # already passed shouldn't dilute the actual problem.
+            reasons = [str(payload[f"{c}_reasoning"]) for c in _VERIFY_CRITERIA if passed or not criteria_passed[c]]
+            return VerifierVerdict(passed=passed, reasoning=" ".join(reasons))
         except Exception as e:
             return VerifierVerdict(passed=None, reasoning=f"verifier_error: {e}")
 
     @step
     async def verify(self, ctx: Context, ev: VerifyEvent) -> DraftEvent | StopEvent:
         verdict = await self._run_verifier(ev)
+        if verdict.passed is True and _weak_retrieval(ev.retrieved_chunks, self.verify_score_floor):
+            verdict = VerifierVerdict(
+                passed=False,
+                reasoning=(
+                    f"retrieval override: verifier passed the draft, but the best retrieved chunk "
+                    f"scored below {self.verify_score_floor}, so the grounding it was judged against is weak."
+                ),
+            )
         if verdict.passed is False and ev.iteration < self.max_iterations:
             requery = _build_requery(ev.query, verdict.reasoning)
             new_chunks = self.retriever.retrieve(requery, top_k=self.top_k)
