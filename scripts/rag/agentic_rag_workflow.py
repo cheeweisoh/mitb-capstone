@@ -18,6 +18,27 @@ _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 DEFAULT_MAX_ITERATIONS = 2
 
 
+def _build_requery(question: str, feedback: str) -> str:
+    """Fold the verifier's rejection reasoning into the original question so
+    the follow-up retrieval call is a genuinely different query, not the same
+    one asked twice (which would return the same ranked results)."""
+    return f"{question}\n\n{feedback}"
+
+
+def _merge_and_rerank_chunks(existing: list[dict[str, Any]], new: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+    """Union existing and newly-retrieved chunks, deduplicated by chunk_id
+    (keeping the higher score on a duplicate), sorted by score, and capped to
+    top_k. Ties keep their first-seen order, so `existing` chunks win over
+    `new` chunks scored identically."""
+    by_id: dict[str, dict[str, Any]] = {}
+    for chunk in existing + new:
+        chunk_id = chunk["chunk_id"]
+        if chunk_id not in by_id or chunk["score"] > by_id[chunk_id]["score"]:
+            by_id[chunk_id] = chunk
+    ranked = sorted(by_id.values(), key=lambda c: c["score"], reverse=True)
+    return ranked[:top_k]
+
+
 @dataclass
 class VerifierVerdict:
     passed: bool | None  # None = verifier itself errored (fail-open, tri-state)
@@ -49,12 +70,15 @@ class VerifyEvent(Event):
 
 
 class AgenticRagWorkflow(Workflow):
-    """Retrieve once, then loop draft -> verify -> redraft until the verifier
-    passes the answer or max_iterations is reached.
+    """Retrieve, then loop draft -> verify -> (re-retrieve +) redraft until the
+    verifier passes the answer or max_iterations is reached.
 
-    On a failed verification, the verifier's reasoning is fed back into the
-    next draft prompt alongside the rejected answer (the retrieved chunks and
-    query are unchanged across iterations). A verifier error (fail-open,
+    On a failed verification, the verifier's reasoning is fed back both into
+    a follow-up retrieval call (query + reasoning, merged with the original
+    chunks and re-ranked by score) and into the next draft prompt alongside
+    the rejected answer. This lets the loop recover from bad retrieval, not
+    just bad phrasing: a chunk the first query missed can still surface if
+    the verifier's feedback names what's missing. A verifier error (fail-open,
     passed=None) is treated the same as a pass, since it doesn't indicate the
     answer is actually wrong.
     """
@@ -110,9 +134,12 @@ class AgenticRagWorkflow(Workflow):
     async def verify(self, ctx: Context, ev: VerifyEvent) -> DraftEvent | StopEvent:
         verdict = await self._run_verifier(ev)
         if verdict.passed is False and ev.iteration < self.max_iterations:
+            requery = _build_requery(ev.query, verdict.reasoning)
+            new_chunks = self.retriever.retrieve(requery, top_k=self.top_k)
+            retrieved_chunks = _merge_and_rerank_chunks(ev.retrieved_chunks, new_chunks, self.top_k)
             return DraftEvent(
                 query=ev.query,
-                retrieved_chunks=ev.retrieved_chunks,
+                retrieved_chunks=retrieved_chunks,
                 iteration=ev.iteration + 1,
                 prior_draft=ev.draft_answer,
                 feedback=verdict.reasoning,
