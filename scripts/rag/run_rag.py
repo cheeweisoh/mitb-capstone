@@ -12,7 +12,9 @@ from tqdm import tqdm
 from agentic_rag_workflow import (DEFAULT_MAX_ITERATIONS, DEFAULT_VERIFY_SCORE_FLOOR,
                                   AgenticRagWorkflow)
 from generator_adapters import ADAPTER_BUILDERS
-from llamaindex_retriever import DEFAULT_INDEX_DIR, DEFAULT_MIN_SCORE, LlamaIndexRagRetriever
+from llamaindex_retriever import (DEFAULT_INDEX_DIR, DEFAULT_MIN_SCORE,
+                                  DEFAULT_RERANK_FETCH_MULTIPLIER, DEFAULT_RERANK_MODEL,
+                                  LlamaIndexRagRetriever)
 from rag_prompts import load_qa_rows, make_output_record, sleep_before_retry
 
 DEFAULT_INPUT_PATH = Path("dataset/guidelines/guidelines_qa_pairs.csv")
@@ -39,7 +41,11 @@ class NoVerifyLLM:
     async def agenerate(self, system_prompt: str, user_prompt: str) -> str:
         skipped = {"passed": True, "reasoning": "verification skipped (--no-verify)"}
         return json.dumps(
-            {f"{c}_{field}": skipped[field] for c in ("groundedness", "safety", "responsiveness") for field in skipped}
+            {
+                f"{c}_{field}": skipped[field]
+                for c in ("groundedness", "safety", "responsiveness", "coverage")
+                for field in skipped
+            }
         )
 
 
@@ -67,6 +73,18 @@ def parse_args() -> argparse.Namespace:
         help=f"Override a verifier pass to a fail if the best retrieved chunk scores below this. Default: {DEFAULT_VERIFY_SCORE_FLOOR}",
     )
     parser.add_argument("--retries", type=int, default=3, help="Retries if a row's final answer comes back empty. Default: 3")
+    parser.add_argument(
+        "--rerank-model",
+        default=DEFAULT_RERANK_MODEL,
+        help=f"Cross-encoder model used to rerank dense candidates before applying top-k/min-score. Default: {DEFAULT_RERANK_MODEL}",
+    )
+    parser.add_argument("--no-rerank", action="store_true", help="Disable cross-encoder reranking; use plain dense top-k retrieval.")
+    parser.add_argument(
+        "--rerank-fetch-multiplier",
+        type=int,
+        default=DEFAULT_RERANK_FETCH_MULTIPLIER,
+        help=f"Dense candidates fetched (as a multiple of top-k) for the reranker to choose from. Default: {DEFAULT_RERANK_FETCH_MULTIPLIER}",
+    )
     return parser.parse_args()
 
 
@@ -85,6 +103,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--max-iterations must be at least 1")
     if not 0 <= args.verify_score_floor <= 1:
         raise SystemExit("--verify-score-floor must be between 0 and 1")
+    if args.rerank_fetch_multiplier < 1:
+        raise SystemExit("--rerank-fetch-multiplier must be at least 1")
 
 
 async def generate_for_row(workflow: AgenticRagWorkflow, question: str, retries: int):
@@ -112,7 +132,12 @@ async def main_async() -> None:
 
     qa_df = load_qa_rows(args.input, rows=args.rows)
 
-    retriever = LlamaIndexRagRetriever(index_dir=args.index, min_score=args.min_score)
+    retriever = LlamaIndexRagRetriever(
+        index_dir=args.index,
+        min_score=args.min_score,
+        rerank_model=None if args.no_rerank else args.rerank_model,
+        rerank_fetch_multiplier=args.rerank_fetch_multiplier,
+    )
     generator = ADAPTER_BUILDERS[args.model]()
     verifier_llm = NoVerifyLLM() if args.no_verify else generator
     workflow = AgenticRagWorkflow(

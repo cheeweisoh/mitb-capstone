@@ -37,7 +37,7 @@ def _strip_after_markers(text: str, markers: list[str]) -> str:
 
 
 class ChatGPTAdapter:
-    def __init__(self, model: str = "gpt-4o-mini", temperature: float = 0, max_tokens: int = 384) -> None:
+    def __init__(self, model: str = "gpt-4o-mini", temperature: float = 0, max_tokens: int = 512) -> None:
         self.llm = OpenAI(model=model, temperature=temperature, max_tokens=max_tokens)
 
     async def agenerate(self, system_prompt: str, user_prompt: str) -> str | None:
@@ -136,7 +136,10 @@ def build_medalpaca_adapter() -> HFCompletionAdapter:
         is_chat_model=False,
         completion_to_prompt=lambda prompt: (
             "Below is a patient question and clinical guideline context. "
-            "Provide a concise and specific answer in two to three sentences, with citations like [C1].\n\n"
+            "Give a concise, patient-facing answer (normally two to three sentences, longer if needed to "
+            "include a numeric threshold, timeframe, or escalation criterion the excerpts state -- but "
+            "only if you can point to where the excerpts state it, never from your own knowledge), with "
+            "citations like [C1].\n\n"
             f"### Instruction:\n{prompt}\n\n### Response:\n"
         ),
     )
@@ -233,7 +236,7 @@ def build_openbio_adapter() -> HFChatAdapter:
 
 class MedGemmaLLM(CustomLLM):
     context_window: int = 8192
-    num_output: int = 384
+    num_output: int = 512
     model_name: str = "google/medgemma-4b-it"
 
     def __init__(self, **kwargs: Any) -> None:

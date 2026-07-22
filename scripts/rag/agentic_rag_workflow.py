@@ -19,15 +19,19 @@ DEFAULT_MAX_ITERATIONS = 2
 
 # Criteria the verifier must pass independently; failing any one fails the
 # whole verdict (see rag_prompts.VERIFY_USER_PROMPT for the matching schema).
-_VERIFY_CRITERIA = ("groundedness", "safety", "responsiveness")
+_VERIFY_CRITERIA = ("groundedness", "safety", "responsiveness", "coverage")
 
 # Failing one of these criteria is worth spending a re-retrieval + redraft
 # cycle on; a responsiveness-only failure (non-answer, incomplete answer)
 # still fails the overall verdict and is reported as such, but doesn't burn a
 # retry -- it's not the failure mode re-retrieval can fix, and it wasn't the
 # category behind the false-positive-driven regressions we saw from a stricter
-# verifier.
-_RETRY_TRIGGERING_CRITERIA = frozenset({"groundedness", "safety"})
+# verifier. Coverage failures (draft omits a threshold/timeframe/escalation
+# detail the matched excerpt states) are retry-eligible: folding the
+# verifier's "missing X" reasoning into the requery (_build_requery) can pull
+# in a more specific chunk carrying that detail, and the redraft prompt is
+# told explicitly what was dropped.
+_RETRY_TRIGGERING_CRITERIA = frozenset({"groundedness", "safety", "coverage"})
 
 # Retrieval-confidence floor used to override a verifier "pass" even when the
 # LLM verdict looked fine: a verifier judging a draft as grounded, safe, and
@@ -137,8 +141,8 @@ class AgenticRagWorkflow(Workflow):
     iterations, ties going to the earlier attempt (its retrieval wasn't shaped
     by a requery chasing the verifier's feedback).
 
-    Not every failing criterion is worth a retry: only groundedness/safety
-    failures trigger re-retrieval (see _RETRY_TRIGGERING_CRITERIA). A
+    Not every failing criterion is worth a retry: only groundedness/safety/
+    coverage failures trigger re-retrieval (see _RETRY_TRIGGERING_CRITERIA). A
     responsiveness-only failure still fails the overall verdict and is
     reported honestly, but doesn't spend a retry cycle on a failure mode
     re-retrieval can't fix anyway.

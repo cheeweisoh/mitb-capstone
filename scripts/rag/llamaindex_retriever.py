@@ -4,6 +4,7 @@ from typing import Any
 
 import faiss
 from llama_index.core import StorageContext, VectorStoreIndex, load_index_from_storage
+from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.schema import NodeWithScore, TextNode
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.faiss import FaissVectorStore
@@ -16,6 +17,18 @@ DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # eval scores on the guidelines RAG run: below 0.40 avg composite ~4.20,
 # at/above ~4.39-4.56 (Mann-Whitney p=0.0084, joined result/eval on question).
 DEFAULT_MIN_SCORE = 0.40
+# Cross-encoder used to re-rank the dense candidate pool. The dense retriever
+# (a bi-encoder) frequently ranks a chunk highest on vocabulary/topic overlap
+# alone -- e.g. a generic "Recommendation 6" from an unrelated guideline
+# scoring above the real answer -- because it embeds query and chunk
+# independently. A cross-encoder scores query and chunk jointly, so it catches
+# that mismatch; see llamaindex_retriever manual smoke test in the RAG
+# improvement work for a concrete example of this reordering.
+DEFAULT_RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# Dense candidates fetched (as a multiple of top_k) before reranking, so the
+# cross-encoder has a wider pool to promote a genuinely on-topic chunk from,
+# not just whatever the bi-encoder already ranked in the top_k.
+DEFAULT_RERANK_FETCH_MULTIPLIER = 4
 
 
 def load_chunk_rows(chunks_path: Path = DEFAULT_CHUNKS_PATH) -> list[dict[str, str]]:
@@ -101,9 +114,13 @@ def node_to_result_dict(node_with_score: NodeWithScore) -> dict[str, Any]:
     return result
 
 
-def dense_search(index: VectorStoreIndex, query: str, top_k: int) -> list[dict[str, Any]]:
+def dense_search_nodes(index: VectorStoreIndex, query: str, top_k: int) -> list[NodeWithScore]:
     retriever = index.as_retriever(similarity_top_k=top_k)
-    return [node_to_result_dict(nws) for nws in retriever.retrieve(query)]
+    return retriever.retrieve(query)
+
+
+def dense_search(index: VectorStoreIndex, query: str, top_k: int) -> list[dict[str, Any]]:
+    return [node_to_result_dict(nws) for nws in dense_search_nodes(index, query, top_k)]
 
 
 class LlamaIndexRagRetriever:
@@ -117,6 +134,8 @@ class LlamaIndexRagRetriever:
         embed_model_name: str = DEFAULT_EMBED_MODEL,
         device: str | None = None,
         min_score: float = DEFAULT_MIN_SCORE,
+        rerank_model: str | None = DEFAULT_RERANK_MODEL,
+        rerank_fetch_multiplier: int = DEFAULT_RERANK_FETCH_MULTIPLIER,
     ) -> None:
         self.index = build_or_load_index(
             chunks_path=chunks_path,
@@ -125,7 +144,40 @@ class LlamaIndexRagRetriever:
             device=device,
         )
         self.min_score = min_score
+        self.rerank_fetch_multiplier = rerank_fetch_multiplier
+        # top_n is set per-call in retrieve() since top_k can vary by caller;
+        # rerank_model=None disables reranking (plain dense top-k + min_score,
+        # the pre-rerank behavior).
+        self.reranker = (
+            SentenceTransformerRerank(model=rerank_model, top_n=1, keep_retrieval_score=True, device=device)
+            if rerank_model
+            else None
+        )
 
     def retrieve(self, query: str, top_k: int) -> list[dict[str, Any]]:
-        results = dense_search(self.index, query, top_k)
+        if self.reranker is None:
+            results = dense_search(self.index, query, top_k)
+            return [result for result in results if result["score"] >= self.min_score]
+
+        fetch_k = max(top_k * self.rerank_fetch_multiplier, top_k)
+        candidates = dense_search_nodes(self.index, query, fetch_k)
+        if not candidates:
+            return []
+
+        self.reranker.top_n = top_k
+        reranked = self.reranker.postprocess_nodes(candidates, query_str=query)
+
+        results = []
+        for node_with_score in reranked:
+            result = node_to_result_dict(node_with_score)
+            # keep_retrieval_score stashed the pre-rerank cosine score in
+            # metadata (as "retrieval_score") before overwriting node.score
+            # with the cross-encoder's own score. Restore the cosine score as
+            # `score` so min_score / verify_score_floor keep comparing against
+            # the calibrated 0-1 cosine scale; the cross-encoder's uncalibrated
+            # logit score is kept separately for visibility/debugging.
+            result["rerank_score"] = result["score"]
+            result["score"] = float(result.pop("retrieval_score", result["rerank_score"]))
+            results.append(result)
+
         return [result for result in results if result["score"] >= self.min_score]

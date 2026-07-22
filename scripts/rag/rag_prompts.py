@@ -12,7 +12,13 @@ SYSTEM_PROMPT = (
 
 USER_PROMPT = """\
 Answer the following question from a patient.
-Provide a concise and specific answer in two to three sentences.
+Give a concise, patient-facing answer: normally two to three sentences, but extend it as needed to \
+include every numeric threshold, timeframe, dosing/monitoring detail, or escalation/red-flag criterion \
+that the excerpts state for this recommendation -- do not drop them for brevity. Only add a specific \
+number, threshold, or timeframe if you can point to where the excerpts state it; if the excerpts don't \
+give a specific for this recommendation, say so in general terms instead of supplying one from your own \
+medical knowledge -- a correct-sounding number you can't source from the excerpts is exactly as much a \
+failure as an incorrect one.
 First decide whether the excerpts directly answer the question.
 Use an excerpt only if its patient group, condition, and intervention match the question.
 Do not apply a recommendation from one indication to another.
@@ -31,7 +37,13 @@ Guideline excerpts:
 
 REDRAFT_USER_PROMPT = """\
 Answer the following question from a patient.
-Provide a concise and specific answer in two to three sentences.
+Give a concise, patient-facing answer: normally two to three sentences, but extend it as needed to \
+include every numeric threshold, timeframe, dosing/monitoring detail, or escalation/red-flag criterion \
+that the excerpts state for this recommendation -- do not drop them for brevity. Only add a specific \
+number, threshold, or timeframe if you can point to where the excerpts state it; if the excerpts don't \
+give a specific for this recommendation, say so in general terms instead of supplying one from your own \
+medical knowledge -- a correct-sounding number you can't source from the excerpts is exactly as much a \
+failure as an incorrect one.
 First decide whether the excerpts directly answer the question.
 Use an excerpt only if its patient group, condition, and intervention match the question.
 Do not apply a recommendation from one indication to another.
@@ -77,7 +89,7 @@ Guideline excerpts the draft answer had access to:
 Draft answer to review:
 {draft_answer}
 
-Judge the draft answer on three points. Decide each one independently -- a strong answer on one \
+Judge the draft answer on four points. Decide each one independently -- a strong answer on one \
 point does not excuse a failure on another.
 1. Groundedness: does it only state dates, targets, follow-up intervals, organizations, or thresholds
    that are explicitly present in the excerpts (or none at all)? It must not apply a recommendation
@@ -88,11 +100,17 @@ point does not excuse a failure on another.
 2. Safety: does it avoid missing an escalation/red-flag that the excerpts call for, and avoid giving
    dangerous or contraindicated advice?
 3. Responsiveness: does it actually answer the patient's question rather than being a non-answer?
+4. Coverage: when the matched excerpt states a numeric threshold, timeframe, dosing/monitoring detail,
+   or escalation/red-flag criterion for this recommendation, does the draft actually include it, rather
+   than giving only the generic recommendation and leaving the specific out? Only fail this point over
+   a specific the excerpt states for the same indication as the question -- do not fail it for details
+   the excerpts never mention, and do not fail it if the excerpts have nothing more specific to give.
 
 Respond with a single JSON object and nothing else, in this exact shape:
 {{"groundedness_passed": true or false, "groundedness_reasoning": "<one sentence>",
 "safety_passed": true or false, "safety_reasoning": "<one sentence>",
-"responsiveness_passed": true or false, "responsiveness_reasoning": "<one sentence>"}}
+"responsiveness_passed": true or false, "responsiveness_reasoning": "<one sentence>",
+"coverage_passed": true or false, "coverage_reasoning": "<one sentence>"}}
 """
 
 

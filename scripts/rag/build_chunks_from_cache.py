@@ -1,5 +1,6 @@
 import argparse
 import csv
+import difflib
 import hashlib
 import json
 import re
@@ -13,6 +14,25 @@ DEFAULT_MIN_WORDS = 30
 DEFAULT_MAX_WORDS = 700
 DEFAULT_OVERLAP_WORDS = 100
 DEFAULT_MERGE_UNDER_WORDS = 100
+# Full-document similarity ratio (difflib, on normalized text) above which a
+# source_file is treated as a near-duplicate of an earlier one -- e.g. the
+# same guideline uploaded twice under "X.pdf" and "X (1).pdf". Below 1.0
+# because re-extracted duplicates rarely come back byte-identical (OCR/vision
+# extraction noise, minor whitespace differences), but a genuine duplicate
+# still tracks far above genuinely-different guidelines on the same topic.
+DEFAULT_DUPLICATE_SIMILARITY = 0.90
+
+# Per-document override for --max-words. The Stroke Rehabilitation Guidelines
+# document is ~5x larger than the next-largest guideline (169 of 608 total
+# corpus chunks) and packs ~98 similarly-worded recommendations into that
+# space, so the default chunk size blends adjacent recommendations together
+# and dense retrieval regularly confuses one for another (see the RAG
+# retrieval-gap analysis: ~36% content-overlap hit rate vs 70-90%+ for
+# smaller, single-topic guidelines). Chunking it more finely isolates
+# individual recommendations instead of diluting them into a bigger blend.
+PER_DOCUMENT_MAX_WORDS = {
+    "Singapore Stroke Rehabilitation Guidelines (April 2026) [PDF].pdf": 350,
+}
 
 SKIP_HEADING_RE = re.compile(
     r"^("
@@ -32,7 +52,11 @@ SKIP_HEADING_RE = re.compile(
     r"find out more about ace|"
     r"acknowledgements?|"
     r"appendix|"
-    r"annex"
+    r"annex|"
+    r"(?:\d+(?:\.\d+)*\.?\s+)?summary of local evidence|"
+    r"(?:\d+(?:\.\d+)*\.?\s+)?list of tables and figures|"
+    r"declaration form|"
+    r"conflict of interest"
     r")\b",
     re.IGNORECASE,
 )
@@ -104,6 +128,14 @@ FRONT_MATTER_RE = re.compile(
     r"\b(first published|last updated|published):\s+\d{1,2}\s+\w+\s+\d{4}\b|" r"\bwww\.ace-hta\.gov\.sg\b",
     re.IGNORECASE,
 )
+
+# A bibliography entry looks like "196. Elsner B, Kugler J, Pohl M, Mehrholz
+# J." -- repeated "Lastname INITIALS" author fragments. This catches
+# reference lists that trail onto the end of a real section (so they never
+# get their own SKIP_HEADING_RE-matched heading) rather than only ones that
+# start a page.
+REFERENCE_ENTRY_RE = re.compile(r"\b[A-Z][a-zA-Z'-]+\s[A-Z]{1,3}(?:,|\.(?!\w)|\sand\b)")
+REFERENCE_DENSITY_PER_100_WORDS = 4
 
 
 @dataclass
@@ -200,8 +232,28 @@ def detect_heading(line: str) -> str | None:
     return cleaned[:120]
 
 
-def should_skip_section(heading: str) -> bool:
-    return bool(SKIP_HEADING_RE.match(heading.strip()))
+# SKIP_HEADING_RE overlaps heavily with STRONG_HEADING_RE (e.g. "ministry of
+# health singapore", "foreword", "citation" are legitimate section-boundary
+# headings that are ALSO administrative/low-value). That's fine when such a
+# heading's section really is just a short administrative blurb, but PDF text
+# extraction sometimes bleeds a short institutional-affiliation line
+# mid-paragraph (e.g. a "Ministry of Health Singapore" stamp between two
+# sentences of real clinical content), and detect_heading then treats that
+# stray line as a new section boundary. Trusting the heading match alone
+# would silently drop the substantial, non-boilerplate content that follows.
+# So only skip on heading alone for short sections (genuine administrative
+# blurbs are short); a longer section under a skip-listed heading still has
+# to independently look like boilerplate via should_skip_text.
+SKIP_HEADING_MAX_WORDS = 100
+
+
+def should_skip_section(heading: str, text: str = "") -> bool:
+    if not SKIP_HEADING_RE.match(heading.strip()):
+        return False
+    # A long section is caught by the separate should_skip_text(section.text)
+    # check at the call site if it's genuinely boilerplate; here we only
+    # trust the heading match on its own for short sections.
+    return word_count(text) <= SKIP_HEADING_MAX_WORDS
 
 
 def is_table_of_contents(text: str) -> bool:
@@ -221,8 +273,16 @@ def is_front_matter_only(heading: str, text: str) -> bool:
     return bool(FRONT_MATTER_RE.search(normalized[:800]))
 
 
+def is_reference_heavy(text: str) -> bool:
+    words = word_count(text)
+    if words < 20:
+        return False
+    matches = len(REFERENCE_ENTRY_RE.findall(text))
+    return (matches / words) * 100 >= REFERENCE_DENSITY_PER_100_WORDS
+
+
 def should_skip_text(text: str) -> bool:
-    return bool(SKIP_TEXT_RE.search(text) or is_table_of_contents(text))
+    return bool(SKIP_TEXT_RE.search(text) or is_table_of_contents(text) or is_reference_heavy(text))
 
 
 def is_strong_split_heading(heading: str) -> bool:
@@ -240,6 +300,43 @@ def load_cache(path: Path) -> dict[str, Any]:
         raise ValueError(f"Expected JSON object in {path}, found {type(data).__name__}")
 
     return data
+
+
+def document_text(pages: list[Page]) -> str:
+    return normalize_text(" ".join(page.text for page in pages)).casefold()
+
+
+def find_duplicate_source_files(
+    pages_by_file: dict[str, list[Page]],
+    similarity_threshold: float = DEFAULT_DUPLICATE_SIMILARITY,
+) -> dict[str, str]:
+    """Detect near-duplicate documents -- e.g. the same guideline uploaded
+    twice as 'X.pdf' and 'X (1).pdf' -- by comparing normalized full-text
+    content. Returns {duplicate_source_file: canonical_source_file}, mapping
+    every filename found to be a near-duplicate of an earlier (sorted-first)
+    one to that canonical filename. Comparison is capped to the first 8000
+    normalized characters per document, which is enough to distinguish
+    genuinely different guidelines while keeping the pairwise scan cheap."""
+    texts = {name: document_text(pages)[:8000] for name, pages in pages_by_file.items()}
+    kept: list[str] = []
+    duplicate_of: dict[str, str] = {}
+
+    for name in sorted(texts):
+        text = texts[name]
+        match = None
+        for other in kept:
+            if not text or not texts[other]:
+                continue
+            ratio = difflib.SequenceMatcher(None, text, texts[other]).ratio()
+            if ratio >= similarity_threshold:
+                match = other
+                break
+        if match:
+            duplicate_of[name] = match
+        else:
+            kept.append(name)
+
+    return duplicate_of
 
 
 def group_pages(cache: dict[str, Any]) -> tuple[dict[str, list[Page]], int]:
@@ -314,19 +411,30 @@ def merge_short_sections(sections: list[Section], merge_under_words: int, max_wo
 
     for section in sections:
         if pending is not None:
-            combined_words = word_count(pending.text) + word_count(section.text)
-            if combined_words <= max_words:
-                section = Section(
-                    source_file=section.source_file,
-                    heading=pending.heading,
-                    start_page=pending.start_page,
-                    end_page=max(pending.end_page, section.end_page),
-                    text=f"{pending.text} {section.text}",
-                )
-                pending = None
-            else:
+            if is_strong_split_heading(section.heading):
+                # Don't blend a short orphan fragment into a genuine
+                # recommendation section under the orphan's (usually
+                # generic/leftover) heading -- that corrupts the boundary
+                # between two distinct recommendations and mislabels the
+                # merged chunk. Flush the orphan standalone instead; if it's
+                # truly tiny it gets dropped later by the min_words check in
+                # split_section_to_records.
                 merged.append(pending)
                 pending = None
+            else:
+                combined_words = word_count(pending.text) + word_count(section.text)
+                if combined_words <= max_words:
+                    section = Section(
+                        source_file=section.source_file,
+                        heading=pending.heading,
+                        start_page=pending.start_page,
+                        end_page=max(pending.end_page, section.end_page),
+                        text=f"{pending.text} {section.text}",
+                    )
+                    pending = None
+                else:
+                    merged.append(pending)
+                    pending = None
 
         section_words = word_count(section.text)
         if section_words >= merge_under_words or is_strong_split_heading(section.heading):
@@ -368,7 +476,7 @@ def split_section_to_records(
     max_words: int,
     overlap_words: int,
 ) -> list[dict[str, str | int]]:
-    if should_skip_section(section.heading) or is_front_matter_only(section.heading, section.text) or should_skip_text(section.text) or word_count(section.text) < min_words:
+    if should_skip_section(section.heading, section.text) or is_front_matter_only(section.heading, section.text) or should_skip_text(section.text) or word_count(section.text) < min_words:
         return []
 
     chunks = split_words(section.text, max_words=max_words, overlap_words=overlap_words)
@@ -405,25 +513,29 @@ def build_section_records(
     max_words: int,
     overlap_words: int,
     merge_under_words: int,
-) -> tuple[list[dict[str, str | int]], int, int]:
+) -> tuple[list[dict[str, str | int]], int, int, dict[str, str]]:
     pages_by_file, skipped_pages = group_pages(cache)
+    duplicate_of = find_duplicate_source_files(pages_by_file)
     records: list[dict[str, str | int]] = []
     skipped_sections = 0
     seen_hashes: set[str] = set()
 
     for source_file in sorted(pages_by_file):
+        if source_file in duplicate_of:
+            continue
+        doc_max_words = PER_DOCUMENT_MAX_WORDS.get(source_file, max_words)
         sections = split_pages_into_sections(pages_by_file[source_file])
         sections = merge_short_sections(
             sections,
             merge_under_words=merge_under_words,
-            max_words=max_words,
+            max_words=doc_max_words,
         )
         for section_index, section in enumerate(sections, start=1):
             section_records = split_section_to_records(
                 section,
                 section_index=section_index,
                 min_words=min_words,
-                max_words=max_words,
+                max_words=doc_max_words,
                 overlap_words=overlap_words,
             )
             if section_records:
@@ -437,7 +549,7 @@ def build_section_records(
             else:
                 skipped_sections += 1
 
-    return records, skipped_pages, skipped_sections
+    return records, skipped_pages, skipped_sections, duplicate_of
 
 
 def build_page_records(
@@ -445,13 +557,16 @@ def build_page_records(
     min_words: int,
     max_words: int | None,
     overlap_words: int,
-) -> tuple[list[dict[str, str | int]], int, int]:
+) -> tuple[list[dict[str, str | int]], int, int, dict[str, str]]:
     records: list[dict[str, str | int]] = []
     pages_by_file, skipped_pages = group_pages(cache)
+    duplicate_of = find_duplicate_source_files(pages_by_file)
     skipped_chunks = 0
     seen_hashes: set[str] = set()
 
     for source_file in sorted(pages_by_file):
+        if source_file in duplicate_of:
+            continue
         for page in pages_by_file[source_file]:
             text = normalize_text(page.text)
             if word_count(text) < min_words:
@@ -481,7 +596,7 @@ def build_page_records(
                     }
                 )
 
-    return records, skipped_pages, skipped_chunks
+    return records, skipped_pages, skipped_chunks, duplicate_of
 
 
 def write_csv(records: list[dict[str, str | int]], path: Path) -> None:
@@ -568,7 +683,7 @@ def main() -> None:
 
     cache = load_cache(args.cache)
     if args.mode == "section":
-        records, skipped_pages, skipped_chunks = build_section_records(
+        records, skipped_pages, skipped_chunks, duplicate_of = build_section_records(
             cache,
             min_words=args.min_words,
             max_words=args.max_words,
@@ -577,7 +692,7 @@ def main() -> None:
         )
     else:
         max_words = args.max_words or None
-        records, skipped_pages, skipped_chunks = build_page_records(
+        records, skipped_pages, skipped_chunks, duplicate_of = build_page_records(
             cache,
             min_words=args.min_words,
             max_words=max_words,
@@ -589,6 +704,10 @@ def main() -> None:
     print(f"Loaded {len(cache)} cached pages from {args.cache}")
     print(f"Skipped {skipped_pages} empty or failed extraction pages")
     print(f"Skipped {skipped_chunks} short or excluded chunks")
+    if duplicate_of:
+        print(f"Skipped {len(duplicate_of)} duplicate source file(s) (same content as another file):")
+        for duplicate, canonical in sorted(duplicate_of.items()):
+            print(f"  {duplicate!r} -> kept {canonical!r}")
     print(f"Wrote {len(records)} {args.mode}-mode chunks " f"from {len(source_files)} source files to {args.output}")
 
 
