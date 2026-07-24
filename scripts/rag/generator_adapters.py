@@ -220,7 +220,10 @@ def build_openbio_adapter() -> HFChatAdapter:
         # though the ~6GB 4-bit model fits easily in 24GB VRAM -- and 4-bit
         # modules can't actually run off-GPU without llm_int8_enable_fp32_cpu_offload.
         # Pinning to the single visible GPU sidesteps that budgeting entirely.
-        device_map = {"": 0}
+        # (llama_index's HuggingFaceLLM.device_map is typed as a plain str, so
+        # we use a device string rather than the dict form transformers also
+        # accepts -- transformers converts "cuda:0" to {"": device} itself.)
+        device_map = "cuda:0"
     else:
         model_kwargs = {"dtype": torch.bfloat16}
         device_map = "auto"
