@@ -9,13 +9,14 @@ from dotenv import load_dotenv
 from huggingface_hub import login
 from tqdm import tqdm
 
-from agentic_rag_workflow import (DEFAULT_MAX_ITERATIONS, DEFAULT_VERIFY_SCORE_FLOOR,
-                                  AgenticRagWorkflow)
+from agentic_rag_workflow import (DEFAULT_MAX_ITERATIONS, DEFAULT_MAX_ROUTE_ITERATIONS,
+                                  DEFAULT_VERIFY_SCORE_FLOOR, AgenticRagWorkflow)
 from generator_adapters import ADAPTER_BUILDERS
 from llamaindex_retriever import (DEFAULT_INDEX_DIR, DEFAULT_MIN_SCORE,
                                   DEFAULT_RERANK_FETCH_MULTIPLIER, DEFAULT_RERANK_MODEL,
                                   LlamaIndexRagRetriever)
 from rag_prompts import load_qa_rows, make_output_record, sleep_before_retry
+from topic_router import TopicRouter
 
 DEFAULT_INPUT_PATH = Path("dataset/guidelines/guidelines_qa_pairs.csv")
 DEFAULT_TOP_K = 5
@@ -85,6 +86,17 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_RERANK_FETCH_MULTIPLIER,
         help=f"Dense candidates fetched (as a multiple of top-k) for the reranker to choose from. Default: {DEFAULT_RERANK_FETCH_MULTIPLIER}",
     )
+    parser.add_argument("--no-bm25", action="store_true", help="Disable BM25 hybrid retrieval; use dense-only candidate fetch.")
+    parser.add_argument("--no-router", action="store_true", help="Disable the topic-routing step; retrieve across the whole corpus unfiltered.")
+    parser.add_argument(
+        "--max-route-iterations",
+        type=int,
+        default=DEFAULT_MAX_ROUTE_ITERATIONS,
+        help=(
+            "Max times the routing step can re-pick a topic after a named pick found nothing, "
+            f"independent of --max-iterations (the verify/redraft budget). Default: {DEFAULT_MAX_ROUTE_ITERATIONS}"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -105,6 +117,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--verify-score-floor must be between 0 and 1")
     if args.rerank_fetch_multiplier < 1:
         raise SystemExit("--rerank-fetch-multiplier must be at least 1")
+    if args.max_route_iterations < 1:
+        raise SystemExit("--max-route-iterations must be at least 1")
 
 
 async def generate_for_row(workflow: AgenticRagWorkflow, question: str, retries: int):
@@ -137,9 +151,14 @@ async def main_async() -> None:
         min_score=args.min_score,
         rerank_model=None if args.no_rerank else args.rerank_model,
         rerank_fetch_multiplier=args.rerank_fetch_multiplier,
+        hybrid=not args.no_bm25,
     )
     generator = ADAPTER_BUILDERS[args.model]()
     verifier_llm = NoVerifyLLM() if args.no_verify else generator
+    topic_router = None
+    if not args.no_router:
+        topic_router = TopicRouter()
+        await topic_router.ensure_descriptions(generator)
     workflow = AgenticRagWorkflow(
         retriever=retriever,
         generator=generator,
@@ -148,6 +167,8 @@ async def main_async() -> None:
         max_context_chars=args.max_context_chars,
         max_iterations=args.max_iterations,
         verify_score_floor=None if args.no_verify else args.verify_score_floor,
+        topic_router=topic_router,
+        max_route_iterations=args.max_route_iterations,
         timeout=None,
     )
 

@@ -10,15 +10,95 @@ SYSTEM_PROMPT = (
     "Return the final patient-facing answer only."
 )
 
+ROUTE_SYSTEM_PROMPT = (
+    "You are a fast triage classifier for a clinical guideline retrieval system. Given a patient "
+    "question and a list of available guideline topics, decide which topic(s), if any, the question "
+    "is actually about. Be conservative: a question merely mentioning a symptom that happens to "
+    "overlap with a guideline's wording is not enough -- only pick a topic if the question's core "
+    "concern matches it."
+)
+
+ROUTE_USER_TEMPLATE = """\
+Patient question:
+{question}
+
+Available guideline topics (label: what it covers):
+{topic_list}
+{feedback_block}
+Respond with a single JSON object and nothing else, in this exact shape:
+{{"labels": ["<0 to 2 topic labels from the list above -- just the label before the colon, exactly as written>"], "reasoning": "<one sentence>"}}
+Use an empty list for "labels" if none of the topics are actually about this question.
+"""
+
+ROUTE_RETRY_FEEDBACK_TEMPLATE = """
+Your previous pick ({previous_labels}) turned up no strong matches when searched: {previous_reasoning}
+Pick a different topic if another one is plausible, or return an empty list if none of the available \
+topics actually cover this question.
+"""
+
+
+def build_route_user_prompt(question: str, topic_labels: list[str], feedback: tuple[list[str], str] | None = None) -> str:
+    topic_list = "\n".join(f"- {label}" for label in topic_labels)
+    if feedback:
+        previous_labels, previous_reasoning = feedback
+        feedback_block = ROUTE_RETRY_FEEDBACK_TEMPLATE.format(previous_labels=", ".join(previous_labels) or "none", previous_reasoning=previous_reasoning)
+    else:
+        feedback_block = ""
+    return ROUTE_USER_TEMPLATE.format(question=question, topic_list=topic_list, feedback_block=feedback_block)
+
+
+DESCRIBE_TOPIC_SYSTEM_PROMPT = (
+    "You summarize a clinical guideline document in one short sentence for a triage classifier "
+    "that will match patient questions against it. Name the specific conditions, symptoms, "
+    "complications, and clinical terms this guideline covers -- including less-obvious terms a "
+    "patient might use that don't share vocabulary with the topic's own name (e.g. a specific "
+    "symptom, complication, or alternate name for the condition)."
+)
+
+DESCRIBE_TOPIC_USER_TEMPLATE = """\
+Guideline topic label: {label}
+
+Section headings from this guideline:
+{headings}
+
+Write one sentence (max ~25 words), plain text only, no JSON or formatting: what conditions, \
+symptoms, and clinical terms does this guideline cover?
+"""
+
+
+def build_describe_topic_user_prompt(label: str, headings: str) -> str:
+    return DESCRIBE_TOPIC_USER_TEMPLATE.format(label=label, headings=headings)
+
+
+def parse_route_response(text: str) -> tuple[list[str] | None, str]:
+    """Parse the router's JSON verdict. Returns (labels, reasoning).
+
+    labels is None on a parse failure -- distinct from an explicit empty list, which means the
+    router confidently decided no topic covers the question (skip retrieval). A parse error is
+    unknown, not a confident "not covered" verdict, so callers should fall back to unfiltered
+    retrieval on None, the same fail-safe posture as the verifier's fail-open behavior on error."""
+    try:
+        payload = json.loads(text)
+        labels = [str(label) for label in payload.get("labels", [])]
+        reasoning = str(payload.get("reasoning", ""))
+        return labels, reasoning
+    except Exception:
+        return None, "route_parse_error"
+
 USER_PROMPT = """\
 Answer the following question from a patient.
-Give a concise, patient-facing answer: normally two to three sentences, but extend it as needed to \
-include every numeric threshold, timeframe, dosing/monitoring detail, or escalation/red-flag criterion \
-that the excerpts state for this recommendation -- do not drop them for brevity. Only add a specific \
-number, threshold, or timeframe if you can point to where the excerpts state it; if the excerpts don't \
-give a specific for this recommendation, say so in general terms instead of supplying one from your own \
-medical knowledge -- a correct-sounding number you can't source from the excerpts is exactly as much a \
-failure as an incorrect one.
+Give a concise, patient-facing answer: normally two to three sentences. Identify which excerpt -- or \
+which part of an excerpt -- most directly answers the specific thing the patient is asking about, not \
+just which excerpt covers the same condition, and base your answer on that. If that excerpt states a \
+numeric threshold, timeframe, dosing/monitoring detail, or escalation/red-flag criterion for the specific \
+point the patient raised, include it -- do not drop it for brevity. Do not pull in a threshold or \
+criterion from a different retrieved excerpt just because it's about the same condition; a recommendation \
+about a different clinical decision (e.g. surgical referral criteria) is not relevant to a question about \
+something else on the same condition (e.g. starting exercise), even if both were retrieved. Only add a \
+specific number, threshold, or timeframe if you can point to where the excerpts state it for the point \
+being asked about; if the excerpts don't give a specific for this recommendation, say so in general terms \
+instead of supplying one from your own medical knowledge -- a correct-sounding number you can't source from \
+the excerpts is exactly as much a failure as an incorrect one.
 First decide whether the excerpts directly answer the question.
 Use an excerpt only if its patient group, condition, and intervention match the question.
 Do not apply a recommendation from one indication to another.
@@ -37,13 +117,18 @@ Guideline excerpts:
 
 REDRAFT_USER_PROMPT = """\
 Answer the following question from a patient.
-Give a concise, patient-facing answer: normally two to three sentences, but extend it as needed to \
-include every numeric threshold, timeframe, dosing/monitoring detail, or escalation/red-flag criterion \
-that the excerpts state for this recommendation -- do not drop them for brevity. Only add a specific \
-number, threshold, or timeframe if you can point to where the excerpts state it; if the excerpts don't \
-give a specific for this recommendation, say so in general terms instead of supplying one from your own \
-medical knowledge -- a correct-sounding number you can't source from the excerpts is exactly as much a \
-failure as an incorrect one.
+Give a concise, patient-facing answer: normally two to three sentences. Identify which excerpt -- or \
+which part of an excerpt -- most directly answers the specific thing the patient is asking about, not \
+just which excerpt covers the same condition, and base your answer on that. If that excerpt states a \
+numeric threshold, timeframe, dosing/monitoring detail, or escalation/red-flag criterion for the specific \
+point the patient raised, include it -- do not drop it for brevity. Do not pull in a threshold or \
+criterion from a different retrieved excerpt just because it's about the same condition; a recommendation \
+about a different clinical decision (e.g. surgical referral criteria) is not relevant to a question about \
+something else on the same condition (e.g. starting exercise), even if both were retrieved. Only add a \
+specific number, threshold, or timeframe if you can point to where the excerpts state it for the point \
+being asked about; if the excerpts don't give a specific for this recommendation, say so in general terms \
+instead of supplying one from your own medical knowledge -- a correct-sounding number you can't source from \
+the excerpts is exactly as much a failure as an incorrect one.
 First decide whether the excerpts directly answer the question.
 Use an excerpt only if its patient group, condition, and intervention match the question.
 Do not apply a recommendation from one indication to another.
@@ -100,11 +185,14 @@ point does not excuse a failure on another.
 2. Safety: does it avoid missing an escalation/red-flag that the excerpts call for, and avoid giving
    dangerous or contraindicated advice?
 3. Responsiveness: does it actually answer the patient's question rather than being a non-answer?
-4. Coverage: when the matched excerpt states a numeric threshold, timeframe, dosing/monitoring detail,
-   or escalation/red-flag criterion for this recommendation, does the draft actually include it, rather
-   than giving only the generic recommendation and leaving the specific out? Only fail this point over
-   a specific the excerpt states for the same indication as the question -- do not fail it for details
-   the excerpts never mention, and do not fail it if the excerpts have nothing more specific to give.
+4. Coverage: when the excerpt that specifically answers what the patient asked states a numeric
+   threshold, timeframe, dosing/monitoring detail, or escalation/red-flag criterion for that specific
+   point, does the draft actually include it, rather than giving only the generic recommendation and
+   leaving the specific out? Only fail this point over a specific from the excerpt answering the exact
+   thing the patient asked about -- a threshold from a different recommendation on the same condition
+   (e.g. surgical referral criteria when the patient asked about starting exercise) does not count, do
+   not fail it for details the excerpts never mention, and do not fail it if the excerpts have nothing
+   more specific to give for that point.
 
 Respond with a single JSON object and nothing else, in this exact shape:
 {{"groundedness_passed": true or false, "groundedness_reasoning": "<one sentence>",

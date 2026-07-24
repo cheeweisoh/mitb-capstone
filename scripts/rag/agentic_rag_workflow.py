@@ -16,6 +16,13 @@ from rag_prompts import (SYSTEM_PROMPT, VERIFY_SYSTEM_PROMPT,
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 DEFAULT_MAX_ITERATIONS = 2
+# Separate, independent bound on how many times the routing step (which
+# guideline topic, if any, is this question about -- see topic_router.py) can
+# re-decide within a single question. Kept apart from DEFAULT_MAX_ITERATIONS
+# (the verify/redraft budget) on purpose: routing and verification catch
+# different failure classes -- routing narrows *what's retrieved*, before
+# generation; verification checks *the generated answer itself*, after.
+DEFAULT_MAX_ROUTE_ITERATIONS = 2
 
 # Criteria the verifier must pass independently; failing any one fails the
 # whole verdict (see rag_prompts.VERIFY_USER_PROMPT for the matching schema).
@@ -121,8 +128,15 @@ class VerifyEvent(Event):
 
 
 class AgenticRagWorkflow(Workflow):
-    """Retrieve, then loop draft -> verify -> (re-retrieve +) redraft until the
-    verifier passes the answer or max_iterations is reached.
+    """Route (if topic_router is set) -> retrieve, then loop draft -> verify ->
+    (re-retrieve +) redraft until the verifier passes the answer or
+    max_iterations is reached.
+
+    Routing is a separate, independently-bounded decision from verification:
+    it picks which guideline topic(s) (if any) to retrieve from *before* any
+    generation happens, capped at max_route_iterations retries on its own
+    weak-retrieval signal (topic named but nothing found). It never looks at
+    the draft answer -- that's what the verify/redraft loop below is for.
 
     On a failed verification, the verifier's reasoning is fed back both into
     a follow-up retrieval call (query + reasoning, merged with the original
@@ -157,6 +171,8 @@ class AgenticRagWorkflow(Workflow):
         max_context_chars: int = 7000,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         verify_score_floor: float | None = DEFAULT_VERIFY_SCORE_FLOOR,
+        topic_router: Any | None = None,
+        max_route_iterations: int = DEFAULT_MAX_ROUTE_ITERATIONS,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -167,11 +183,39 @@ class AgenticRagWorkflow(Workflow):
         self.max_context_chars = max_context_chars
         self.max_iterations = max_iterations
         self.verify_score_floor = verify_score_floor
+        self.topic_router = topic_router
+        self.max_route_iterations = max_route_iterations
 
     @step
     async def retrieve(self, ctx: Context, ev: StartEvent) -> DraftEvent:
         question = ev.get("question")
-        chunks = self.retriever.retrieve(question, top_k=self.top_k)
+        if self.topic_router is None:
+            chunks = self.retriever.retrieve(question, top_k=self.top_k)
+            return DraftEvent(query=question, retrieved_chunks=chunks, iteration=1)
+
+        # Bounded routing loop, independent of the verify/redraft loop below:
+        # ask which topic(s) (if any) the question is about, retrieve
+        # filtered to those, and only re-ask (up to max_route_iterations) if
+        # that filtered retrieval came back empty -- a named-but-wrong topic
+        # pick is worth one retry; a confident "not covered" or a parse error
+        # is terminal (see topic_router.route's return contract).
+        feedback: tuple[list[str], str] | None = None
+        chunks: list[dict[str, Any]] = []
+        for route_iteration in range(1, self.max_route_iterations + 1):
+            source_file_filter, reasoning = await self.topic_router.route(self.generator, question, feedback=feedback)
+
+            if source_file_filter is None:
+                chunks = self.retriever.retrieve(question, top_k=self.top_k)
+                break
+            if not source_file_filter:
+                chunks = []
+                break
+
+            chunks = self.retriever.retrieve(question, top_k=self.top_k, source_file_filter=source_file_filter)
+            if chunks or route_iteration == self.max_route_iterations:
+                break
+            feedback = (source_file_filter, "no chunks in that topic cleared the relevance floor")
+
         return DraftEvent(query=question, retrieved_chunks=chunks, iteration=1)
 
     @step
