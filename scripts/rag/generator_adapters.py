@@ -198,19 +198,38 @@ def build_openbio_adapter() -> HFChatAdapter:
         tokenizer.convert_tokens_to_ids("<|eot_id|>"),
     ]
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
     os.environ["DISABLE_SAFETENSORS_CONVERSION"] = "1"
+
+    # bitsandbytes 4-bit quantization requires CUDA; on machines without a
+    # CUDA GPU (e.g. Apple Silicon with only MPS), device_map="auto" would
+    # dispatch the quantized modules to CPU/disk, which bitsandbytes cannot
+    # run. Fall back to plain bf16 loading in that case, matching the other
+    # HF adapters (meditron, medalpaca).
+    if torch.cuda.is_available():
+        model_kwargs = {
+            "quantization_config": BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+        }
+        # On a single-GPU box (e.g. a Colab L4), device_map="auto" still
+        # calls accelerate's infer_auto_device_map, which budgets memory
+        # conservatively and can dispatch some layers to "cpu"/"disk" even
+        # though the ~6GB 4-bit model fits easily in 24GB VRAM -- and 4-bit
+        # modules can't actually run off-GPU without llm_int8_enable_fp32_cpu_offload.
+        # Pinning to the single visible GPU sidesteps that budgeting entirely.
+        device_map = {"": 0}
+    else:
+        model_kwargs = {"dtype": torch.bfloat16}
+        device_map = "auto"
 
     llm = HuggingFaceLLM(
         model_name=model_id,
         tokenizer=tokenizer,
-        model_kwargs={"quantization_config": bnb_config},
-        device_map="auto",
+        model_kwargs=model_kwargs,
+        device_map=device_map,
         max_new_tokens=512,
         stopping_ids=terminators,
         generate_kwargs={
